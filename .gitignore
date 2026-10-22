@@ -1,0 +1,44 @@
+# Gradle, Android Studio and generated outputs
+.gradle/
+.gradle-home/
+.kotlin/
+**/build/
+**/out/
+/dist/
+/tools/
+/local.properties
+.idea/
+*.iml
+*.hprof
+*.class
+*.log
+captures/
+.externalNativeBuild/
+.cxx/
+
+# Signing material and local configuration
+*.keystore
+*.jks
+*.p12
+*.pfx
+keystore.properties
+signing.properties
+.env
+.env.*
+!.env.example
+
+# Android packages and reverse engineering outputs
+*.apk
+*.aab
+*.apks
+*.apkm
+*.ap_
+*.idsig
+*.dex
+*.smali
+
+# Python and OS files
+__pycache__/
+*.py[cod]
+.DS_Store
+Thumbs.db

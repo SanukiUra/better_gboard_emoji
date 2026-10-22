@@ -1,0 +1,10 @@
+{
+  "source": "rime-wanxiang/lua/data/emoji.txt",
+  "project": "万象拼音 / rime-wanxiang",
+  "upstream": "https://github.com/amzxyz/rime-wanxiang",
+  "license": "CC BY 4.0",
+  "license_url": "https://creativecommons.org/licenses/by/4.0/",
+  "source_sha256": "637a2aafb329e892aab9b537dc35ae6b7fc3a491cbc3b9edcc541c95f15f518a",
+  "import_date": "2026-10-11",
+  "changes": "Original bytes preserved. Runtime removes plain non-emoji values, merges duplicate keys and removes duplicate values; first emoji is inserted."
+}

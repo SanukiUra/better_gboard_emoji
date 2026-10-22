@@ -1,0 +1,52 @@
+plugins { id 'com.android.application' }
+
+def moduleVersion = new Properties()
+rootProject.file('version.properties').withInputStream { moduleVersion.load(it) }
+def signingValues = ['ANDROID_KEYSTORE_PATH', 'ANDROID_KEYSTORE_PASSWORD', 'ANDROID_KEY_ALIAS', 'ANDROID_KEY_PASSWORD']
+        .collectEntries { name -> [(name): providers.environmentVariable(name).orNull] }
+def hasReleaseSigning = signingValues.values().every { it != null && !it.isEmpty() }
+if (signingValues.values().any { it != null && !it.isEmpty() } && !hasReleaseSigning) {
+    throw new GradleException('Release signing requires all four ANDROID_KEYSTORE_* / ANDROID_KEY_* environment variables.')
+}
+
+android {
+    namespace 'io.github.sanuki.gboardemoji'
+    compileSdk 36
+    buildToolsVersion '36.0.0'
+    defaultConfig {
+        applicationId 'io.github.sanuki.gboardemoji'
+        minSdk 26
+        targetSdk 35
+        versionCode moduleVersion.getProperty('VERSION_CODE').toInteger()
+        versionName moduleVersion.getProperty('VERSION_NAME')
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+    buildFeatures { buildConfig true }
+    sourceSets {
+        test.resources.srcDir 'src/main/assets'
+    }
+    signingConfigs {
+        if (hasReleaseSigning) {
+            release {
+                storeFile file(signingValues['ANDROID_KEYSTORE_PATH'])
+                storePassword signingValues['ANDROID_KEYSTORE_PASSWORD']
+                keyAlias signingValues['ANDROID_KEY_ALIAS']
+                keyPassword signingValues['ANDROID_KEY_PASSWORD']
+            }
+        }
+    }
+    buildTypes {
+        release {
+            minifyEnabled false
+            if (hasReleaseSigning) signingConfig signingConfigs.release
+        }
+    }
+}
+
+dependencies {
+    compileOnly 'de.robv.android.xposed:api:82'
+    testImplementation 'junit:junit:4.13.2'
+}
