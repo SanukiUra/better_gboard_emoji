@@ -26,7 +26,18 @@ jobs:
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
-        run: python3 tools/prepare_release.py --tag "$RELEASE_TAG"
+        run: |
+          set -euo pipefail
+          VERSION_NAME=$(grep '^VERSION_NAME=' version.properties | cut -d= -f2 | tr -d '[:space:]')
+          if [[ "$RELEASE_TAG" != "v$VERSION_NAME" ]]; then
+            echo "Tag $RELEASE_TAG does not match version.properties (v$VERSION_NAME)" >&2
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/gboard-release-signing"
+          KEYSTORE_PATH="$RUNNER_TEMP/gboard-release-signing/release.keystore"
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | tr -d '[:space:]' | base64 --decode > "$KEYSTORE_PATH"
+          chmod 600 "$KEYSTORE_PATH"
+          echo "ANDROID_KEYSTORE_PATH=$KEYSTORE_PATH" >> "$GITHUB_ENV"
       - name: Set up Java 17
         uses: actions/setup-java@v5
         with:
@@ -48,7 +59,13 @@ jobs:
       - name: Package Release
         env:
           RELEASE_TAG: ${{ github.ref_name }}
-        run: python3 tools/package_release.py app/build/outputs/apk/release/app-release.apk --tag "$RELEASE_TAG"
+        run: |
+          set -euo pipefail
+          VERSION_NAME="${RELEASE_TAG#v}"
+          mkdir -p dist
+          OUT="Gboard-Wanxiang-Enhancer-${VERSION_NAME}.apk"
+          cp app/build/outputs/apk/release/app-release.apk "dist/$OUT"
+          (cd dist && sha256sum "$OUT" > SHA256SUMS)
       - name: Upload Release assets
         uses: actions/upload-artifact@v4
         with:
