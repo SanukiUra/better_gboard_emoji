@@ -11,8 +11,12 @@ if (signingValues.values().any { it != null && !it.isEmpty() } && !hasReleaseSig
 
 android {
     namespace 'io.github.sanuki.gboardemoji'
-    compileSdk 36
-    buildToolsVersion '36.0.0'
+    compileSdk {
+        version = release(36) {
+            minorApiLevel = 1
+        }
+    }
+    buildToolsVersion '36.1.0'
     defaultConfig {
         applicationId 'io.github.sanuki.gboardemoji'
         minSdk 26

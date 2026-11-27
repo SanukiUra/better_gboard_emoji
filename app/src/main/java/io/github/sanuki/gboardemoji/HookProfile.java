@@ -6,7 +6,6 @@ import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.util.Properties;
 
-/** Inspected version profiles and structurally resolved profiles share the same representation. */
 public final class HookProfile {
     private final Properties values;
 
@@ -16,6 +15,11 @@ public final class HookProfile {
 
     public String builderField(String name) {
         return values.getProperty("builder." + name, get(name));
+    }
+
+    public boolean has(String name) {
+        String value = values.getProperty(name);
+        return value != null && !value.trim().isEmpty();
     }
 
     public static HookProfile read(InputStream input) throws IOException {

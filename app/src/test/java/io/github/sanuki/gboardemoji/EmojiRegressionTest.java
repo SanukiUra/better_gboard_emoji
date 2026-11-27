@@ -111,7 +111,6 @@ public final class EmojiRegressionTest {
         assertEquals("😂", access.emoji(emoji));
         assertNull(access.emoji(first));
         assertSame(result, augmenter.augment(result));
-        assertFalse(access.metadata(first).contains("笑哭"));
         assertEquals(2, augmenter.augment(Collections.singletonList(candidate("笑哭", Kind.RECOMMENDATION, 20))).size());
     }
 

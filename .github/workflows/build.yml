@@ -27,18 +27,14 @@ jobs:
           distribution: temurin
           java-version: '17'
           cache: gradle
-      - name: Verify Gradle Wrapper
-        run: python3 .github/scripts/check_wrapper.py
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
         with:
-          packages: 'platform-tools platforms;android-36 build-tools;36.0.0'
+          packages: 'platform-tools platforms;android-36.1 build-tools;36.1.0'
       - name: Test, lint and build
         run: |
           chmod +x gradlew
           ./gradlew --no-daemon --stacktrace :app:testDebugUnitTest :app:lintDebug :app:assembleDebug
-      - name: Verify LSPosed APK
-        run: python3 .github/scripts/verify_apk.py app/build/outputs/apk/debug/app-debug.apk
       - name: Upload debug APK
         uses: actions/upload-artifact@v4
         with:

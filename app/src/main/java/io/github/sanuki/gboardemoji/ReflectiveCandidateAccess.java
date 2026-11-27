@@ -7,7 +7,7 @@ import java.util.Collections;
 import java.util.Map;
 import java.util.WeakHashMap;
 
-/** Uses Gboard's own builder; never mutates the original candidate. */
+/** Creates synthetic Gboard Candidate instances via Gboard's own builder without mutating existing ones. */
 public final class ReflectiveCandidateAccess implements CandidateAugmenter.Access {
     private final Class<?> candidateClass;
     private final Constructor<?> builder;
@@ -23,8 +23,9 @@ public final class ReflectiveCandidateAccess implements CandidateAugmenter.Acces
     private final Field removable;
     private final Field highlighted;
     private final Field decoration;
-    // Weak keys: candidates from previous compositions must not accumulate.
-    private final Map<Object, String> injected = Collections.synchronizedMap(new WeakHashMap<>());
+
+    private final Map<Object, String> injectedEmoji = Collections.synchronizedMap(new WeakHashMap<>());
+    private final Map<Object, ZiranmaAuxEngine.AuxItem> injectedAux = Collections.synchronizedMap(new WeakHashMap<>());
 
     public ReflectiveCandidateAccess(ClassLoader loader, HookProfile profile) throws Exception {
         candidateClass = Class.forName(profile.get("candidateClass"), false, loader);
@@ -33,29 +34,23 @@ public final class ReflectiveCandidateAccess implements CandidateAugmenter.Acces
         builder.setAccessible(true);
         copy = builderClass.getDeclaredMethod(profile.get("builderCopy"), candidateClass);
         build = builderClass.getDeclaredMethod(profile.get("builderBuild"));
-        if (copy.getReturnType() != void.class || build.getReturnType() != candidateClass) {
-            throw new IllegalArgumentException("Candidate builder signature changed");
-        }
         copy.setAccessible(true);
         build.setAccessible(true);
-        candidateText = field(candidateClass, profile.get("commitTextField"), CharSequence.class);
-        kind = candidateClass.getDeclaredField(profile.get("kindField"));
-        if (!kind.getType().isEnum()) throw new IllegalArgumentException("Candidate kind changed");
-        kind.setAccessible(true);
-        data = field(candidateClass, profile.get("dataField"), Object.class);
-        commitText = field(builderClass, profile.builderField("commitTextField"), CharSequence.class);
-        displayText = field(builderClass, profile.builderField("displayTextField"), CharSequence.class);
-        description = field(builderClass, profile.builderField("descriptionField"), String.class);
-        annotation = field(builderClass, profile.builderField("annotationField"), CharSequence.class);
-        removable = field(builderClass, profile.builderField("removableField"), boolean.class);
-        highlighted = field(builderClass, profile.builderField("highlightField"), boolean.class);
-        decoration = builderClass.getDeclaredField(profile.builderField("decorationField"));
-        decoration.setAccessible(true);
+
+        candidateText = field(candidateClass, profile.get("commitTextField"));
+        kind = field(candidateClass, profile.get("kindField"));
+        data = field(candidateClass, profile.get("dataField"));
+        commitText = field(builderClass, profile.builderField("commitTextField"));
+        displayText = field(builderClass, profile.builderField("displayTextField"));
+        description = field(builderClass, profile.builderField("descriptionField"));
+        annotation = field(builderClass, profile.builderField("annotationField"));
+        removable = field(builderClass, profile.builderField("removableField"));
+        highlighted = field(builderClass, profile.builderField("highlightField"));
+        decoration = field(builderClass, profile.builderField("decorationField"));
     }
 
-    private static Field field(Class<?> owner, String name, Class<?> type) throws Exception {
+    private static Field field(Class<?> owner, String name) throws Exception {
         Field field = owner.getDeclaredField(name);
-        if (field.getType() != type) throw new IllegalArgumentException("Changed field: " + name);
         field.setAccessible(true);
         return field;
     }
@@ -74,7 +69,6 @@ public final class ReflectiveCandidateAccess implements CandidateAugmenter.Acces
         if (!(value instanceof Enum) || !"RECOMMENDATION".equals(((Enum<?>) value).name())) {
             return false;
         }
-        // Native IDs are decoder indices, not visible list positions. Pagination is gated upstream.
         Object index = data.get(candidate);
         if (!(index instanceof Integer) || (Integer) index < 0) return false;
         String text = text(candidate);
@@ -87,29 +81,40 @@ public final class ReflectiveCandidateAccess implements CandidateAugmenter.Acces
         return false;
     }
 
-    @Override public boolean injected(Object candidate) { return emoji(candidate) != null; }
-    public String emoji(Object candidate) { return candidate == null ? null : injected.get(candidate); }
+    @Override public boolean injected(Object candidate) {
+        return emoji(candidate) != null || auxItem(candidate) != null;
+    }
 
-    /** Structural diagnostics only; never return the user's candidate text. */
-    public String metadata(Object candidate) throws Exception {
-        if (!candidateClass.isInstance(candidate)) return "非候选对象";
-        Object value = kind.get(candidate), index = data.get(candidate);
-        return "类型=" + (value instanceof Enum ? ((Enum<?>) value).name() : "未知")
-                + "，内部编号=" + (index instanceof Integer ? index : "非整数");
+    public String emoji(Object candidate) {
+        return candidate == null ? null : injectedEmoji.get(candidate);
+    }
+
+    public ZiranmaAuxEngine.AuxItem auxItem(Object candidate) {
+        return candidate == null ? null : injectedAux.get(candidate);
     }
 
     @Override public Object create(Object source, String emoji) throws Exception {
+        Object candidate = buildCopy(source, emoji, false);
+        injectedEmoji.put(candidate, emoji);
+        return candidate;
+    }
+
+    public Object createAux(Object source, ZiranmaAuxEngine.AuxItem item, boolean highlight) throws Exception {
+        Object candidate = buildCopy(source, item.text, highlight);
+        injectedAux.put(candidate, item);
+        return candidate;
+    }
+
+    private Object buildCopy(Object source, String text, boolean highlight) throws Exception {
         Object value = builder.newInstance();
         copy.invoke(value, source);
-        commitText.set(value, emoji);
-        displayText.set(value, emoji);
-        description.set(value, emoji);
+        commitText.set(value, text);
+        displayText.set(value, text);
+        description.set(value, text);
         annotation.set(value, null);
         removable.setBoolean(value, false);
-        highlighted.setBoolean(value, false);
+        highlighted.setBoolean(value, highlight);
         decoration.set(value, null);
-        Object candidate = build.invoke(value);
-        injected.put(candidate, emoji);
-        return candidate;
+        return build.invoke(value);
     }
 }

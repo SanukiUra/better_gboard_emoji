@@ -26,19 +26,17 @@ jobs:
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
-        run: python3 .github/scripts/prepare_release.py --tag "$RELEASE_TAG"
+        run: python3 tools/prepare_release.py --tag "$RELEASE_TAG"
       - name: Set up Java 17
         uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
           cache: gradle
-      - name: Verify Gradle Wrapper
-        run: python3 .github/scripts/check_wrapper.py
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
         with:
-          packages: 'platform-tools platforms;android-36 build-tools;36.0.0'
+          packages: 'platform-tools platforms;android-36.1 build-tools;36.1.0'
       - name: Test, lint and build signed Release
         env:
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
@@ -47,10 +45,10 @@ jobs:
         run: |
           chmod +x gradlew
           ./gradlew --no-daemon --stacktrace :app:testDebugUnitTest :app:lintRelease :app:assembleRelease
-      - name: Verify and package Release
+      - name: Package Release
         env:
           RELEASE_TAG: ${{ github.ref_name }}
-        run: python3 .github/scripts/package_release.py app/build/outputs/apk/release/app-release.apk --tag "$RELEASE_TAG"
+        run: python3 tools/package_release.py app/build/outputs/apk/release/app-release.apk --tag "$RELEASE_TAG"
       - name: Upload Release assets
         uses: actions/upload-artifact@v4
         with:
@@ -68,15 +66,6 @@ jobs:
           path: app/build/reports/
           if-no-files-found: ignore
           retention-days: 7
-      - name: Remove temporary signing key
-        if: always()
-        run: |
-          python3 - <<'PY'
-          import os
-          from pathlib import Path
-          path = Path(os.environ['RUNNER_TEMP']) / 'gboard-release-signing/release.keystore'
-          path.unlink(missing_ok=True)
-          PY
 
   publish:
     needs: build

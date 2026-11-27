@@ -1,21 +1,29 @@
 package io.github.sanuki.gboardemoji;
 
 import android.app.Application;
+import android.content.BroadcastReceiver;
 import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.pm.PackageInfo;
+import android.os.Build;
+import java.io.File;
 import java.io.InputStream;
 import java.io.InputStreamReader;
-import java.io.File;
-import java.lang.reflect.Method;
 import java.lang.reflect.Field;
 import java.lang.reflect.Member;
-import java.lang.reflect.Modifier;
+import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
-import java.util.List;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Deque;
+import java.util.HashSet;
 import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.WeakHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
@@ -27,15 +35,29 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 public final class EmojiHook implements IXposedHookLoadPackage, IXposedHookZygoteInit {
     public static final String TARGET = "com.google.android.inputmethod.latin";
-    private static final String TAG = "[GboardRimeEmoji] ";
+    private static final String TAG = "[GboardWanxiang] ";
+    private static final int KEYCODE_DEL = 0x43;
+
     private static String modulePath;
     private final AtomicBoolean initialized = new AtomicBoolean();
-    private final AtomicBoolean runtimeErrorReported = new AtomicBoolean();
-    private final AtomicBoolean deliveryReported = new AtomicBoolean();
-    private final AtomicBoolean insertionReported = new AtomicBoolean();
     private volatile DiagnosticReporter diagnostics;
-    private volatile boolean enabled;
+
     private final ThreadLocal<Deque<Batch>> batches = ThreadLocal.withInitial(ArrayDeque::new);
+    private final ThreadLocal<Boolean> internalReset = ThreadLocal.withInitial(() -> Boolean.FALSE);
+    private final Map<Object, Boolean> slashModes = Collections.synchronizedMap(new WeakHashMap<>());
+    private final Map<Object, ZiranmaAuxEngine.AuxItem> activeDefaultAux = Collections.synchronizedMap(new WeakHashMap<>());
+    private final Map<Object, Deque<StagedSegment>> stagedSegments = Collections.synchronizedMap(new WeakHashMap<>());
+
+    private static final class StagedSegment {
+        final String text;
+        final String rawConsumed;
+        final int remainingLenAtStage;
+        StagedSegment(String text, String rawConsumed, int remainingLenAtStage) {
+            this.text = text;
+            this.rawConsumed = rawConsumed;
+            this.remainingLenAtStage = remainingLenAtStage;
+        }
+    }
 
     private static final class Batch {
         final Object processor;
@@ -47,179 +69,409 @@ public final class EmojiHook implements IXposedHookLoadPackage, IXposedHookZygot
 
     @Override public void handleLoadPackage(XC_LoadPackage.LoadPackageParam param) throws Throwable {
         if (!TARGET.equals(param.packageName) || !TARGET.equals(param.processName)) return;
-        log("模块 " + DiagnosticReporter.VERSION + " 已进入 Gboard 进程");
         Method attach = Application.class.getDeclaredMethod("attach", Context.class);
         XposedBridge.hookMethod(attach, new XC_MethodHook() {
             @Override protected void afterHookedMethod(MethodHookParam hook) {
                 if (hook.hasThrowable() || !initialized.compareAndSet(false, true)) return;
                 Context context = (Context) hook.args[0];
                 diagnostics = new DiagnosticReporter(context);
-                diagnostics.phase("正在初始化", "正在读取 Gboard 适配配置");
+                diagnostics.status("正在初始化", "加载 Gboard 配置与万象词表");
                 new Thread(() -> {
-                    try { install(context, param.classLoader); }
-                    catch (Throwable failure) {
-                        diagnostics.phase("初始化失败", error(failure));
-                        log("初始化失败；保留 Gboard 原行为：" + failure);
+                    try {
+                        install(context, param.classLoader);
+                    } catch (Throwable t) {
+                        diagnostics.status("初始化失败", shortError(t));
+                        log("初始化失败：" + t);
                     }
-                }, "GboardRimeEmoji-init").start();
+                }, "GboardWanxiang-init").start();
             }
         });
     }
 
     private void install(Context context, ClassLoader loader) throws Exception {
         PackageInfo info = context.getPackageManager().getPackageInfo(TARGET, 0);
-        long version = android.os.Build.VERSION.SDK_INT >= 28 ? info.getLongVersionCode() : info.versionCode;
-        HookProfile profile;
-        EmojiDictionary dictionary;
-        if (modulePath == null) modulePath = context.getPackageManager()
-                .getApplicationInfo(DiagnosticReporter.MODULE, 0).sourceDir;
+        long version = Build.VERSION.SDK_INT >= 28 ? info.getLongVersionCode() : info.versionCode;
+        if (modulePath == null) {
+            modulePath = context.getPackageManager().getApplicationInfo(DiagnosticReporter.MODULE, 0).sourceDir;
+        }
+
+        HookProfile profile = null;
+        EmojiDictionary emojiDict;
+        ZiranmaAuxDictionary auxDict;
+        String profileSource = "内置配置";
+
         try (ZipFile apk = new ZipFile(modulePath)) {
             ZipEntry entry = apk.getEntry("assets/hooks/" + version + ".properties");
-            if (entry == null) {
+            if (entry != null) {
+                try (InputStream in = apk.getInputStream(entry)) {
+                    HookProfile candidate = HookProfile.read(in);
+                    if (candidate.has("keyEventMethod") && candidate.has("pinyinEngineFactoryClass")
+                            && candidate.has("composingMethod") && candidate.has("pgAddMethod")
+                            && candidate.has("baseCommitMethod")) {
+                        profile = candidate;
+                    }
+                }
+            }
+            if (profile == null) {
+                profileSource = "动态字节码解析";
                 List<File> targetApks = new ArrayList<>();
                 targetApks.add(new File(info.applicationInfo.sourceDir));
                 if (info.applicationInfo.splitSourceDirs != null) {
                     for (String path : info.applicationInfo.splitSourceDirs) targetApks.add(new File(path));
                 }
-                log("正在识别 Gboard " + info.versionName + " (" + version + ") 的候选结构");
                 profile = DexProfileResolver.resolve(targetApks, info.versionName);
-                log("已识别候选结构：" + profile.get("candidateClass") + "，选择方法 " + profile.get("selectMethod"));
-            } else {
-                try (InputStream input = apk.getInputStream(entry)) { profile = HookProfile.read(input); }
             }
-            try (InputStream input = apk.getInputStream(apk.getEntry("assets/emoji-map.tsv"))) {
-                dictionary = EmojiDictionary.read(new InputStreamReader(input, StandardCharsets.UTF_8));
+            try (InputStream in = apk.getInputStream(apk.getEntry("assets/emoji-map.tsv"))) {
+                emojiDict = EmojiDictionary.read(new InputStreamReader(in, StandardCharsets.UTF_8));
+            }
+            try (InputStream in = apk.getInputStream(apk.getEntry("assets/ziranma-aux.bin"))) {
+                auxDict = ZiranmaAuxDictionary.read(in);
             }
         }
+
         ReflectiveCandidateAccess access = new ReflectiveCandidateAccess(loader, profile);
-        CandidateAugmenter augmenter = new CandidateAugmenter(dictionary, access);
+        CandidateAugmenter emojiAugmenter = new CandidateAugmenter(emojiDict, access);
+        ZiranmaAuxEngine auxEngine = new ZiranmaAuxEngine(auxDict);
+
         Class<?> chinese = Class.forName(profile.get("chineseProcessor"), false, loader);
+        Class<?> pinyin = Class.forName(profile.get("pinyinProcessor"), false, loader);
         Class<?> hmm = Class.forName(profile.get("hmmProcessor"), false, loader);
+        Class<?> baseProcessor = Class.forName("com.google.android.libraries.inputmethod.ime.processor.core.BaseDecodeProcessor", false, loader);
+        Class<?> eventClass = Class.forName(profile.get("eventClass"), false, loader);
+        Class<?> deliveryClass = Class.forName(profile.get("deliveryClass"), false, loader);
+
         Method select = chinese.getDeclaredMethod(profile.get("selectMethod"), access.candidateClass(), boolean.class);
         Method delete = chinese.getDeclaredMethod(profile.get("deleteMethod"), access.candidateClass());
         Method commit = hmm.getDeclaredMethod(profile.get("commitMethod"), CharSequence.class);
+        Method baseCommit = baseProcessor.getDeclaredMethod(profile.get("baseCommitMethod"), CharSequence.class, int.class);
         Method reset = hmm.getDeclaredMethod(profile.get("resetMethod"));
-        if (select.getReturnType() != boolean.class || delete.getReturnType() != boolean.class
-                || commit.getReturnType() != void.class || reset.getReturnType() != void.class) {
-            throw new IllegalArgumentException("Decoder method signature changed");
-        }
-        commit.setAccessible(true);
-        reset.setAccessible(true);
+        Method composing = hmm.getDeclaredMethod(profile.get("composingMethod"), CharSequence.class);
         Method produce = hmm.getDeclaredMethod(profile.get("batchMethod"), int.class);
         Field iterator = hmm.getDeclaredField(profile.get("iteratorField"));
-        Class<?> deliveryClass = Class.forName(profile.get("deliveryClass"), false, loader);
         Method deliver = deliveryClass.getDeclaredMethod(profile.get("deliveryMethod"),
                 List.class, access.candidateClass(), boolean.class, Object.class);
-        if (produce.getReturnType() != boolean.class || iterator.getType() != Iterator.class
-                || !Modifier.isStatic(deliver.getModifiers()) || deliver.getReturnType() != deliveryClass) {
-            throw new IllegalArgumentException("Candidate delivery signature changed");
-        }
-        iterator.setAccessible(true);
-        CandidateBatchGate gate = new CandidateBatchGate();
 
-        // Install selection hooks first. Partial installation cannot produce unhandled emoji candidates.
-        List<XC_MethodHook.Unhook> hooks = new ArrayList<>();
+        Method keyEvent = pinyin.getDeclaredMethod(profile.get("keyEventMethod"), eventClass);
+        Method space = pinyin.getDeclaredMethod(profile.get("spaceMethod"));
+        Method keyDataGetter = eventClass.getDeclaredMethod(profile.get("keyDataGetter"));
+        Field keyCodeField = keyDataGetter.getReturnType().getDeclaredField(profile.get("keyCodeField"));
+        Field keyPayloadField = keyDataGetter.getReturnType().getDeclaredField(profile.get("keyPayloadField"));
+
+        commit.setAccessible(true);
+        reset.setAccessible(true);
+        iterator.setAccessible(true);
+        keyDataGetter.setAccessible(true);
+        keyCodeField.setAccessible(true);
+        keyPayloadField.setAccessible(true);
+
+        HmmBridge bridge = new HmmBridge(loader, profile, commit, reset);
+        CandidateBatchGate gate = new CandidateBatchGate();
+        GboardSettingsHook.install(loader, profile);
+
+        // Deoptimize batch producer so its saved body does not retain an inlined copy of deliveryMethod.
         try {
-            // Deoptimize the producer before hooking it, so its saved original body cannot retain
-            // an inlined copy of the tiny factory. This is an LSPosed extension to legacy API 82.
             Method deopt = XposedBridge.class.getMethod("deoptimizeMethod", Member.class);
             deopt.invoke(null, produce);
-            addHook(hooks, select, new XC_MethodHook() {
-                @Override protected void beforeHookedMethod(MethodHookParam hook) {
-                    String emoji = access.emoji(hook.args[0]);
-                    if (emoji == null) return;
-                    // Consume the event even on failure, preventing the source Chinese word from committing.
+        } catch (Throwable ignored) {}
+
+        XposedBridge.hookMethod(select, new XC_MethodHook() {
+            @Override protected void beforeHookedMethod(MethodHookParam hook) {
+                Object candidate = hook.args[0];
+                boolean shouldCommit = Boolean.TRUE.equals(hook.args[1]);
+                String emoji = access.emoji(candidate);
+                if (emoji != null) {
                     hook.setResult(true);
                     try {
-                        EmojiSelection.handle(emoji, (Boolean) hook.args[1], new EmojiSelection.Operations() {
+                        EmojiSelection.handle(emoji, shouldCommit, new EmojiSelection.Operations() {
                             @Override public void commit(String value) throws Exception { commit.invoke(hook.thisObject, value); }
                             @Override public void reset() throws Exception {
                                 reset.invoke(hook.thisObject);
-                                diagnostics.count("selected");
+                                diagnostics.count("emoji_selected");
                             }
                         });
-                    } catch (Throwable failure) { runtimeFailure(failure); }
+                    } catch (Throwable t) { log("Emoji 上屏异常：" + t); }
+                    return;
                 }
-            });
-            addHook(hooks, delete, new XC_MethodHook() {
-                @Override protected void beforeHookedMethod(MethodHookParam hook) {
-                    if (access.injected(hook.args[0])) hook.setResult(true);
-                }
-            });
-            addHook(hooks, produce, new XC_MethodHook() {
-                @Override protected void beforeHookedMethod(MethodHookParam hook) {
-                    if (!chinese.isInstance(hook.thisObject)) return;
-                    boolean first = false;
-                    if (enabled) {
-                        diagnostics.count("batches");
-                        try { first = gate.first(hook.thisObject, iterator.get(hook.thisObject)); }
-                        catch (Throwable failure) { runtimeFailure(failure); }
-                    }
-                    batches.get().push(new Batch(hook.thisObject, first));
-                }
-                @Override protected void afterHookedMethod(MethodHookParam hook) {
-                    if (!chinese.isInstance(hook.thisObject)) return;
-                    Deque<Batch> stack = batches.get();
-                    if (!stack.isEmpty()) stack.pop();
-                    if (stack.isEmpty()) batches.remove();
-                }
-            });
-            addHook(hooks, deliver, new XC_MethodHook() {
-                @Override protected void beforeHookedMethod(MethodHookParam hook) {
-                    if (!enabled || !chinese.isInstance(hook.args[3])) return;
-                    Deque<Batch> stack = batches.get();
-                    Batch batch = stack.peek();
-                    if (batch == null || batch.processor != hook.args[3]) {
-                        if (stack.isEmpty()) batches.remove();
-                        return;
-                    }
-                    if (!(hook.args[0] instanceof List)) return;
+                ZiranmaAuxEngine.AuxItem aux = access.auxItem(candidate);
+                if (aux != null) {
+                    hook.setResult(true);
+                    if (!shouldCommit) return;
                     try {
-                        List<?> original = (List<?>) hook.args[0];
-                        Object first = original.isEmpty() ? null : original.get(0);
-                        boolean eligible = first != null && access.eligible(first);
-                        boolean mapped = eligible && !dictionary.lookup(access.text(first)).isEmpty();
-                        List<?> result = batch.first ? augmenter.augment(original) : original;
-                        hook.args[0] = result;
-                        // args[1] is Gboard's default candidate. It stays exactly the same object.
-                        String metadata = access.metadata(first) + "，首批=" + batch.first + "，有映射=" + mapped;
-                        diagnostics.candidate(metadata, eligible, mapped, result != original);
-                        if (deliveryReported.compareAndSet(false, true)) {
-                            log("中文候选事件已进入：" + metadata);
+                        slashModes.remove(hook.thisObject);
+                        activeDefaultAux.remove(hook.thisObject);
+                        if (aux.remainingRawTail != null && !aux.remainingRawTail.isEmpty()) {
+                            HmmBridge.CompositionState state = bridge.readComposition(hook.thisObject);
+                            String rawConsumed = (state != null && aux.consumedRawChars <= state.rawTail.length())
+                                    ? state.rawTail.substring(0, aux.consumedRawChars) : "";
+                            String stageText = (state == null ? "" : state.convertedPrefix) + aux.text;
+                            pushStaged(hook.thisObject, new StagedSegment(stageText, rawConsumed, aux.remainingRawTail.length()));
+                            internalReset.set(Boolean.TRUE);
+                            try {
+                                bridge.resetAndReplay(hook.thisObject, aux.remainingRawTail);
+                            } finally {
+                                internalReset.set(Boolean.FALSE);
+                            }
+                        } else {
+                            bridge.commitAux(hook.thisObject, aux.text, "");
                         }
-                        if (result != original && insertionReported.compareAndSet(false, true)) {
-                            log("已向候选列表插入 emoji；默认候选保持原对象");
-                        }
-                    } catch (Throwable failure) { runtimeFailure(failure); }
+                        diagnostics.count("aux_selected");
+                    } catch (Throwable t) { log("辅码候选上屏异常：" + t); }
                 }
-            });
-            enabled = true;
-            diagnostics.phase("候选 Hook 已安装", "Gboard " + info.versionName + "\n中文候选发送入口；已关闭入口方法内联");
-            log("候选 Hook 已安装：模块 " + DiagnosticReporter.VERSION + "，Gboard " + info.versionName
-                    + "，候选发送 " + deliver + "，映射 " + dictionary.size() + " 条");
-        } catch (Throwable failure) {
-            enabled = false;
-            for (XC_MethodHook.Unhook hook : hooks) hook.unhook();
-            throw new IllegalStateException("Hook installation failed", failure);
+            }
+        });
+
+        XposedBridge.hookMethod(delete, new XC_MethodHook() {
+            @Override protected void beforeHookedMethod(MethodHookParam hook) {
+                if (access.injected(hook.args[0])) hook.setResult(true);
+            }
+        });
+
+        XposedBridge.hookMethod(baseCommit, new XC_MethodHook() {
+            @Override protected void beforeHookedMethod(MethodHookParam hook) {
+                CharSequence text = (CharSequence) hook.args[0];
+                if (text == null || text.length() == 0) return;
+                String staged = consumeStagedText(hook.thisObject);
+                if (!staged.isEmpty()) {
+                    hook.args[0] = staged + text;
+                }
+            }
+        });
+
+        XposedBridge.hookMethod(reset, new XC_MethodHook() {
+            @Override protected void afterHookedMethod(MethodHookParam hook) {
+                slashModes.remove(hook.thisObject);
+                activeDefaultAux.remove(hook.thisObject);
+                if (!Boolean.TRUE.equals(internalReset.get())) {
+                    stagedSegments.remove(hook.thisObject);
+                }
+            }
+        });
+
+        XposedBridge.hookMethod(composing, new XC_MethodHook() {
+            @Override protected void beforeHookedMethod(MethodHookParam hook) {
+                CharSequence current = (CharSequence) hook.args[0];
+                if (current == null || current.length() == 0) return;
+                if (!pinyin.isInstance(hook.thisObject) || !bridge.isZiranmaAuxActive(hook.thisObject)) return;
+                try {
+                    String staged = peekStagedText(hook.thisObject);
+                    HmmBridge.CompositionState state = bridge.readComposition(hook.thisObject);
+                    if (state == null) return;
+                    String formatted = null;
+                    if (state.rawTail.length() >= 3) {
+                        boolean slash = Boolean.TRUE.equals(slashModes.get(hook.thisObject));
+                        formatted = auxEngine.formatComposing(
+                                state.rawTail, slash, state.primaryHasFullSpanWord, bridge.shadowDecoder());
+                    }
+                    if (formatted != null) {
+                        String tail = state.convertedPrefix + formatted;
+                        hook.args[0] = staged.isEmpty() ? tail : (staged + " " + tail);
+                    } else if (!staged.isEmpty()) {
+                        hook.args[0] = staged + " " + current;
+                    }
+                } catch (Throwable t) {
+                    log("拼音行分词格式化异常：" + t);
+                }
+            }
+        });
+
+        XposedBridge.hookMethod(space, new XC_MethodHook() {
+            @Override protected void beforeHookedMethod(MethodHookParam hook) {
+                ZiranmaAuxEngine.AuxItem item = activeDefaultAux.get(hook.thisObject);
+                if (item == null) return;
+                hook.setResult(true);
+                try {
+                    slashModes.remove(hook.thisObject);
+                    activeDefaultAux.remove(hook.thisObject);
+                    bridge.commitAux(hook.thisObject, item.text, item.remainingRawTail);
+                    diagnostics.count("aux_selected");
+                } catch (Throwable t) { log("空格上屏辅码异常：" + t); }
+            }
+        });
+
+        XposedBridge.hookMethod(keyEvent, new XC_MethodHook() {
+            @Override protected void beforeHookedMethod(MethodHookParam hook) {
+                if (!bridge.isZiranmaAuxActive(hook.thisObject)) return;
+                try {
+                    Object keyData = keyDataGetter.invoke(hook.args[0]);
+                    if (keyData == null) return;
+                    int code = keyCodeField.getInt(keyData);
+                    Object payload = keyPayloadField.get(keyData);
+                    if ("/".equals(payload)) {
+                        HmmBridge.CompositionState state = bridge.readComposition(hook.thisObject);
+                        if (state != null && (state.rawTail.length() == 3 || state.rawTail.length() == 4)
+                                && !Boolean.TRUE.equals(slashModes.get(hook.thisObject))) {
+                            slashModes.put(hook.thisObject, Boolean.TRUE);
+                            bridge.refresh(hook.thisObject);
+                            hook.setResult(true);
+                            return;
+                        }
+                    } else if (code == KEYCODE_DEL) {
+                        if (Boolean.TRUE.equals(slashModes.get(hook.thisObject))) {
+                            slashModes.remove(hook.thisObject);
+                            bridge.refresh(hook.thisObject);
+                            hook.setResult(true);
+                            return;
+                        }
+                        Deque<StagedSegment> stack = stagedSegments.get(hook.thisObject);
+                        if (stack != null && !stack.isEmpty()) {
+                            StagedSegment top = stack.peekLast();
+                            HmmBridge.CompositionState state = bridge.readComposition(hook.thisObject);
+                            String curTail = state == null ? "" : state.rawTail;
+                            if (top != null && curTail.length() <= top.remainingLenAtStage) {
+                                stack.pollLast();
+                                if (stack.isEmpty()) stagedSegments.remove(hook.thisObject);
+                                String restored = top.rawConsumed + curTail;
+                                if (!restored.isEmpty()) {
+                                    internalReset.set(Boolean.TRUE);
+                                    try {
+                                        bridge.resetAndReplay(hook.thisObject, restored);
+                                    } finally {
+                                        internalReset.set(Boolean.FALSE);
+                                    }
+                                    hook.setResult(true);
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    slashModes.remove(hook.thisObject);
+                } catch (Throwable t) {
+                    log("按键拦截异常：" + t);
+                }
+            }
+        });
+
+        XposedBridge.hookMethod(produce, new XC_MethodHook() {
+            @Override protected void beforeHookedMethod(MethodHookParam hook) {
+                if (!chinese.isInstance(hook.thisObject)) return;
+                boolean first = false;
+                try {
+                    first = gate.first(hook.thisObject, iterator.get(hook.thisObject));
+                } catch (Throwable t) { log("批次门控异常：" + t); }
+                batches.get().push(new Batch(hook.thisObject, first));
+            }
+            @Override protected void afterHookedMethod(MethodHookParam hook) {
+                if (!chinese.isInstance(hook.thisObject)) return;
+                Deque<Batch> stack = batches.get();
+                if (!stack.isEmpty()) stack.pop();
+                if (stack.isEmpty()) batches.remove();
+            }
+        });
+
+        XposedBridge.hookMethod(deliver, new XC_MethodHook() {
+            @Override protected void beforeHookedMethod(MethodHookParam hook) {
+                if (!chinese.isInstance(hook.args[3]) || !(hook.args[0] instanceof List)) return;
+                Deque<Batch> stack = batches.get();
+                Batch batch = stack.peek();
+                if (batch == null || batch.processor != hook.args[3] || !batch.first) return;
+
+                Object processor = hook.args[3];
+                List<?> current = (List<?>) hook.args[0];
+                if (current.isEmpty()) return;
+
+                try {
+                    activeDefaultAux.remove(processor);
+
+                    // 1. Wanxiang Ziranma auxiliary code resolution (only when "双拼 - 自然码辅助码" is selected).
+                    if (pinyin.isInstance(processor) && bridge.isZiranmaAuxActive(processor)) {
+                        HmmBridge.CompositionState state = bridge.readComposition(processor);
+                        if (state != null && state.rawTail.length() >= 3) {
+                            boolean slash = Boolean.TRUE.equals(slashModes.get(processor));
+                            ZiranmaAuxEngine.AuxPlan plan = auxEngine.resolve(
+                                    state.rawTail, slash, state.primaryHasFullSpanWord, bridge.shadowDecoder());
+                            if (plan != null && !plan.items.isEmpty()) {
+                                List<Object> merged = mergeAuxCandidates(current, plan, access);
+                                current = merged;
+                                if (plan.promoteFirstToDefault) {
+                                    hook.args[1] = merged.get(0);
+                                    activeDefaultAux.put(processor, plan.items.get(0));
+                                }
+                                diagnostics.count("aux_hits");
+                            }
+                        }
+                    }
+
+                    // 2. Emoji candidate insertion at slot #2 (controlled by Gboard Pinyin settings switch).
+                    if (!pinyin.isInstance(processor) || bridge.isEmojiEnabled(processor)) {
+                        List<?> withEmoji = emojiAugmenter.augment(current);
+                        if (withEmoji != current) {
+                            current = withEmoji;
+                            diagnostics.count("emoji_hits");
+                        }
+                    }
+
+                    hook.args[0] = current;
+                } catch (Throwable t) {
+                    log("候选增强异常：" + t);
+                }
+            }
+        });
+
+        String summary = "Gboard " + info.versionName + " (" + profileSource + ")\n"
+                + "自然码辅码：" + auxDict.charCount() + " 字 / " + auxDict.entryCount() + " 条\n"
+                + "Emoji 映射：" + emojiDict.size() + " 条";
+        diagnostics.status("已激活", summary);
+        log("模块已就绪：" + summary.replace('\n', '；'));
+    }
+
+    private static List<Object> mergeAuxCandidates(
+            List<?> original, ZiranmaAuxEngine.AuxPlan plan, ReflectiveCandidateAccess access) throws Exception {
+        Object seed = original.get(0);
+        List<Object> merged = new ArrayList<>(original.size() + plan.items.size());
+        Set<String> seen = new HashSet<>();
+
+        int insertAt = Math.min(plan.insertAt, original.size());
+        for (int i = 0; i < insertAt; i++) {
+            Object cand = original.get(i);
+            merged.add(cand);
+            String t = access.text(cand);
+            if (t != null) seen.add(t);
         }
+
+        for (int i = 0; i < plan.items.size(); i++) {
+            ZiranmaAuxEngine.AuxItem item = plan.items.get(i);
+            if (!seen.add(item.text)) continue;
+            boolean highlight = (i == 0 && plan.promoteFirstToDefault);
+            merged.add(access.createAux(seed, item, highlight));
+        }
+
+        for (int i = insertAt; i < original.size(); i++) {
+            Object cand = original.get(i);
+            String t = access.text(cand);
+            if (t == null || seen.add(t)) merged.add(cand);
+        }
+        return merged;
     }
 
-    private void runtimeFailure(Throwable failure) {
-        enabled = false;
-        if (diagnostics != null) diagnostics.phase("候选 Hook 运行失败", error(failure));
-        if (runtimeErrorReported.compareAndSet(false, true)) log("已停止新增 emoji 候选：" + failure);
+    private void pushStaged(Object processor, StagedSegment seg) {
+        Deque<StagedSegment> stack = stagedSegments.get(processor);
+        if (stack == null) {
+            stack = new ArrayDeque<>();
+            stagedSegments.put(processor, stack);
+        }
+        stack.addLast(seg);
     }
 
-    private static void addHook(List<XC_MethodHook.Unhook> hooks, Method method, XC_MethodHook callback) {
-        XC_MethodHook.Unhook handle = XposedBridge.hookMethod(method, callback);
-        if (handle == null) throw new IllegalStateException("Hook rejected: " + method);
-        hooks.add(handle);
+    private String peekStagedText(Object processor) {
+        Deque<StagedSegment> stack = stagedSegments.get(processor);
+        if (stack == null || stack.isEmpty()) return "";
+        StringBuilder sb = new StringBuilder();
+        for (StagedSegment seg : stack) sb.append(seg.text);
+        return sb.toString();
     }
 
-    private static String error(Throwable failure) {
-        while (failure.getCause() != null && failure.getCause() != failure) failure = failure.getCause();
-        return failure.getClass().getSimpleName() + ": " + failure.getMessage();
+    private String consumeStagedText(Object processor) {
+        Deque<StagedSegment> stack = stagedSegments.remove(processor);
+        if (stack == null || stack.isEmpty()) return "";
+        StringBuilder sb = new StringBuilder();
+        for (StagedSegment seg : stack) sb.append(seg.text);
+        return sb.toString();
     }
 
-    private static void log(String value) { XposedBridge.log(TAG + value); }
+    private static String shortError(Throwable t) {
+        while (t.getCause() != null && t.getCause() != t) t = t.getCause();
+        return t.getClass().getSimpleName() + ": " + t.getMessage();
+    }
+
+    private static void log(String message) { XposedBridge.log(TAG + message); }
 }
